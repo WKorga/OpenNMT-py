@@ -287,6 +287,7 @@ class Translator(object):
             batch_type="sents",
             attn_debug=False,
             align_debug=False,
+            return_attn = False,
             phrase_table=""):
         """Translate content of ``src`` and get gold scores from ``tgt``.
 
@@ -344,6 +345,7 @@ class Translator(object):
 
         all_scores = []
         all_predictions = []
+        attn = []
 
         start_time = time.time()
 
@@ -361,8 +363,9 @@ class Translator(object):
                     gold_score_total += trans.gold_score
                     gold_words_total += len(trans.gold_sent) + 1
 
-                n_best_preds = [" ".join(pred)
-                                for pred in trans.pred_sents[:self.n_best]]
+                # n_best_preds = [" ".join(pred)
+                #                 for pred in trans.pred_sents[:self.n_best]]
+                n_best_preds = trans.pred_sents[:self.n_best]
                 if self.report_align:
                     align_pharaohs = [build_align_pharaoh(align) for align
                                       in trans.word_aligns[:self.n_best]]
@@ -371,9 +374,9 @@ class Translator(object):
                     n_best_preds = [pred + " ||| " + align
                                     for pred, align in zip(
                                         n_best_preds, n_best_preds_align)]
-                all_predictions += [n_best_preds]
-                self.out_file.write('\n'.join(n_best_preds) + '\n')
-                self.out_file.flush()
+                all_predictions = n_best_preds
+                #self.out_file.write('\n'.join(n_best_preds) + '\n')
+                #self.out_file.flush()
 
                 if self.verbose:
                     sent_number = next(counter)
@@ -396,7 +399,10 @@ class Translator(object):
                         self.logger.info(output)
                     else:
                         os.write(1, output.encode('utf-8'))
-
+                if return_attn:
+                    attns = trans.attns[:self.n_best]
+                    for at in attns:
+                        attn.append(at.tolist())
                 if align_debug:
                     if trans.gold_sent is not None:
                         tgts = trans.gold_sent
@@ -436,6 +442,8 @@ class Translator(object):
             import json
             json.dump(self.translator.beam_accum,
                       codecs.open(self.dump_beam, 'w', 'utf-8'))
+        if return_attn:
+            return all_scores, all_predictions, attn
         return all_scores, all_predictions
 
     def _align_pad_prediction(self, predictions, bos, pad):

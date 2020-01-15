@@ -417,13 +417,15 @@ class ServerModel(object):
 
         scores = []
         predictions = []
+        attn = []
         if len(texts_to_translate) > 0:
             try:
-                scores, predictions = self.translator.translate(
+                scores, predictions, attn = self.translator.translate(
                     texts_to_translate,
                     batch_size=len(texts_to_translate)
                     if self.opt.batch_size == 0
-                    else self.opt.batch_size)
+                    else self.opt.batch_size,
+                    return_attn=True)
             except (RuntimeError, Exception) as e:
                 err = "Error: %s" % str(e)
                 self.logger.error(err)
@@ -445,30 +447,30 @@ class ServerModel(object):
         def flatten_list(_list): return sum(_list, [])
         tiled_texts = [t for t in texts_to_translate
                        for _ in range(self.opt.n_best)]
-        results = flatten_list(predictions)
+        #results = flatten_list(predictions)
         scores = [score_tensor.item()
                   for score_tensor in flatten_list(scores)]
+        print(predictions)
+        # results = [self.maybe_detokenize_with_align(result, src)
+        #            for result, src in zip(results, tiled_texts)]
 
-        results = [self.maybe_detokenize_with_align(result, src)
-                   for result, src in zip(results, tiled_texts)]
-
-        aligns = [align for _, align in results]
-        results = [self.maybe_postprocess(seq) for seq, _ in results]
+        #aligns = [align for _, align in results]
+        #results = [self.maybe_postprocess(seq) for seq, _ in results]
 
         # build back results with empty texts
-        for i in empty_indices:
-            j = i * self.opt.n_best
-            results = results[:j] + [""] * self.opt.n_best + results[j:]
-            aligns = aligns[:j] + [None] * self.opt.n_best + aligns[j:]
-            scores = scores[:j] + [0] * self.opt.n_best + scores[j:]
+        # for i in empty_indices:
+        #     j = i * self.opt.n_best
+        #     results = results[:j] + [""] * self.opt.n_best + results[j:]
+        #     aligns = aligns[:j] + [None] * self.opt.n_best + aligns[j:]
+        #     scores = scores[:j] + [0] * self.opt.n_best + scores[j:]
 
-        head_spaces = [h for h in head_spaces for i in range(self.opt.n_best)]
-        tail_spaces = [h for h in tail_spaces for i in range(self.opt.n_best)]
-        results = ["".join(items)
-                   for items in zip(head_spaces, results, tail_spaces)]
+        # head_spaces = [h for h in head_spaces for i in range(self.opt.n_best)]
+        # tail_spaces = [h for h in tail_spaces for i in range(self.opt.n_best)]
+        # results = ["".join(items)
+        #            for items in zip(head_spaces, results, tail_spaces)]
 
-        self.logger.info("Translation Results: %d", len(results))
-        return results, scores, self.opt.n_best, timer.times, aligns
+        #self.logger.info("Translation Results: %d", len(results))
+        return predictions, scores, self.opt.n_best, timer.times, attn
 
     def do_timeout(self):
         """Timeout function that frees GPU memory.
