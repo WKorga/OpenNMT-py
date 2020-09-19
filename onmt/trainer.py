@@ -57,6 +57,24 @@ def build_trainer(opt, device_id, model, fields, optim, model_saver=None):
         opt.early_stopping, scorers=onmt.utils.scorers_from_opts(opt)) \
         if opt.early_stopping > 0 else None
 
+    source_noise = None
+    if len(opt.src_noise) > 0:
+        src_field = dict(fields)["src"].base_field
+        corpus_id_field = dict(fields).get("corpus_id", None)
+        if corpus_id_field is not None:
+            ids_to_noise = corpus_id_field.numericalize(opt.data_to_noise)
+        else:
+            ids_to_noise = None
+        source_noise = onmt.modules.source_noise.MultiNoise(
+            opt.src_noise,
+            opt.src_noise_prob,
+            ids_to_noise=ids_to_noise,
+            pad_idx=src_field.pad_token,
+            end_of_sentence_mask=src_field.end_of_sentence_mask,
+            word_start_mask=src_field.word_start_mask,
+            device_id=device_id
+        )
+
     report_manager = onmt.utils.build_report_manager(opt, gpu_rank)
     trainer = onmt.Trainer(model, train_loss, valid_loss, optim, trunc_size,
                            shard_size, norm_method,
@@ -70,7 +88,8 @@ def build_trainer(opt, device_id, model, fields, optim, model_saver=None):
                            model_dtype=opt.model_dtype,
                            earlystopper=earlystopper,
                            dropout=dropout,
-                           dropout_steps=dropout_steps)
+                           dropout_steps=dropout_steps,
+                           source_noise=source_noise)
     return trainer
 
 
@@ -107,7 +126,8 @@ class Trainer(object):
                  n_gpu=1, gpu_rank=1, gpu_verbose_level=0,
                  report_manager=None, with_align=False, model_saver=None,
                  average_decay=0, average_every=1, model_dtype='fp32',
-                 earlystopper=None, dropout=[0.3], dropout_steps=[0]):
+                 earlystopper=None, dropout=[0.3], dropout_steps=[0],
+                 source_noise=None):
         # Basic attributes.
         self.model = model
         self.train_loss = train_loss
@@ -132,6 +152,7 @@ class Trainer(object):
         self.earlystopper = earlystopper
         self.dropout = dropout
         self.dropout_steps = dropout_steps
+        self.source_noise = source_noise
 
         for i in range(len(self.accum_count_l)):
             assert self.accum_count_l[i] > 0
@@ -183,7 +204,7 @@ class Trainer(object):
             self.moving_average = copy_params
         else:
             average_decay = max(self.average_decay,
-                                1 - (step + 1)/(step + 10))
+                                1 - (step + 1) / (step + 10))
             for (i, avg), cpt in zip(enumerate(self.moving_average),
                                      self.model.parameters()):
                 self.moving_average[i] = \
@@ -274,8 +295,8 @@ class Trainer(object):
                         break
 
             if (self.model_saver is not None
-                and (save_checkpoint_steps != 0
-                     and step % save_checkpoint_steps == 0)):
+                    and (save_checkpoint_steps != 0
+                         and step % save_checkpoint_steps == 0)):
                 self.model_saver.save(step, moving_average=self.moving_average)
 
             if train_steps > 0 and step >= train_steps:
@@ -310,15 +331,16 @@ class Trainer(object):
 
             for batch in valid_iter:
                 src, src_lengths = batch.src if isinstance(batch.src, tuple) \
-                                   else (batch.src, None)
+                    else (batch.src, None)
                 tgt = batch.tgt
 
-                # F-prop through the model.
-                outputs, attns = valid_model(src, tgt, src_lengths,
-                                             with_align=self.with_align)
+                with torch.cuda.amp.autocast(enabled=self.optim.amp):
+                    # F-prop through the model.
+                    outputs, attns = valid_model(src, tgt, src_lengths,
+                                                 with_align=self.with_align)
 
-                # Compute loss.
-                _, batch_stats = self.valid_loss(batch, outputs, attns)
+                    # Compute loss.
+                    _, batch_stats = self.valid_loss(batch, outputs, attns)
 
                 # Update statistics.
                 stats.update(batch_stats)
@@ -345,6 +367,8 @@ class Trainer(object):
             else:
                 trunc_size = target_size
 
+            batch = self.maybe_noise_source(batch)
+
             src, src_lengths = batch.src if isinstance(batch.src, tuple) \
                 else (batch.src, None)
             if src_lengths is not None:
@@ -353,7 +377,7 @@ class Trainer(object):
             tgt_outer = batch.tgt
 
             bptt = False
-            for j in range(0, target_size-1, trunc_size):
+            for j in range(0, target_size - 1, trunc_size):
                 # 1. Create truncated target.
                 tgt = tgt_outer[j: j + trunc_size]
 
@@ -361,12 +385,13 @@ class Trainer(object):
                 if self.accum_count == 1:
                     self.optim.zero_grad()
 
-                outputs, attns = self.model(src, tgt, src_lengths, bptt=bptt,
-                                            with_align=self.with_align)
-                bptt = True
+                with torch.cuda.amp.autocast(enabled=self.optim.amp):
+                    outputs, attns = self.model(
+                        src, tgt, src_lengths, bptt=bptt,
+                        with_align=self.with_align)
+                    bptt = True
 
-                # 3. Compute loss.
-                try:
+                    # 3. Compute loss.
                     loss, batch_stats = self.train_loss(
                         batch,
                         outputs,
@@ -376,6 +401,7 @@ class Trainer(object):
                         trunc_start=j,
                         trunc_size=trunc_size)
 
+                try:
                     if loss is not None:
                         self.optim.backward(loss)
 
@@ -449,7 +475,12 @@ class Trainer(object):
         """
         if self.report_manager is not None:
             return self.report_manager.report_training(
-                step, num_steps, learning_rate, report_stats,
+                step,
+                num_steps,
+                learning_rate,
+                None if self.earlystopper is None
+                else self.earlystopper.current_tolerance,
+                report_stats,
                 multigpu=self.n_gpu > 1)
 
     def _report_step(self, learning_rate, step, train_stats=None,
@@ -460,5 +491,13 @@ class Trainer(object):
         """
         if self.report_manager is not None:
             return self.report_manager.report_step(
-                learning_rate, step, train_stats=train_stats,
+                learning_rate,
+                None if self.earlystopper is None
+                else self.earlystopper.current_tolerance,
+                step, train_stats=train_stats,
                 valid_stats=valid_stats)
+
+    def maybe_noise_source(self, batch):
+        if self.source_noise is not None:
+            return self.source_noise(batch)
+        return batch

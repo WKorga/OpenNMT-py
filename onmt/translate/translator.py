@@ -90,6 +90,7 @@ class Translator(object):
         ignore_when_blocking (set or frozenset): See
             :class:`onmt.translate.decode_strategy.DecodeStrategy`.
         replace_unk (bool): Replace unknown token.
+        tgt_prefix (bool): Force the predictions begin with provided -tgt.
         data_type (str): Source data type.
         verbose (bool): Print/log every translation.
         report_time (bool): Print/log total time/frequency.
@@ -120,6 +121,7 @@ class Translator(object):
             block_ngram_repeat=0,
             ignore_when_blocking=frozenset(),
             replace_unk=False,
+            tgt_prefix=False,
             phrase_table="",
             data_type="text",
             verbose=False,
@@ -167,6 +169,7 @@ class Translator(object):
         if self.replace_unk and not self.model.decoder.attentional:
             raise ValueError(
                 "replace_unk requires an attentional decoder.")
+        self.tgt_prefix = tgt_prefix
         self.phrase_table = phrase_table
         self.data_type = data_type
         self.verbose = verbose
@@ -249,6 +252,7 @@ class Translator(object):
             block_ngram_repeat=opt.block_ngram_repeat,
             ignore_when_blocking=set(opt.ignore_when_blocking),
             replace_unk=opt.replace_unk,
+            tgt_prefix=opt.tgt_prefix,
             phrase_table=opt.phrase_table,
             data_type=opt.data_type,
             verbose=opt.verbose,
@@ -311,11 +315,17 @@ class Translator(object):
         if batch_size is None:
             raise ValueError("batch_size must be set")
 
+        if self.tgt_prefix and tgt is None:
+            raise ValueError('Prefix should be feed to tgt if -tgt_prefix.')
+
         src_data = {"reader": self.src_reader, "data": src, "dir": src_dir}
         tgt_data = {"reader": self.tgt_reader, "data": tgt, "dir": None}
         _readers, _data, _dir = inputters.Dataset.config(
             [('src', src_data), ('tgt', tgt_data)])
 
+        # corpus_id field is useless here
+        if self.fields.get("corpus_id", None) is not None:
+            self.fields.pop('corpus_id')
         data = inputters.Dataset(
             self.fields, readers=_readers, data=_data, dirs=_dir,
             sort_key=inputters.str2sortkey[self.data_type],
@@ -404,10 +414,7 @@ class Translator(object):
                     for at in attns:
                         attn.append(at.tolist())
                 if align_debug:
-                    if trans.gold_sent is not None:
-                        tgts = trans.gold_sent
-                    else:
-                        tgts = trans.pred_sents[0]
+                    tgts = trans.pred_sents[0]
                     align = trans.word_aligns[0].tolist()
                     if self.data_type == 'text':
                         srcs = trans.src_raw
@@ -479,11 +486,8 @@ class Translator(object):
         alignment src indice Tensor in size ``(batch, n_best,)``.
         """
         # (0) add BOS and padding to tgt prediction
-        if hasattr(batch, 'tgt'):
-            batch_tgt_idxs = batch.tgt.transpose(1, 2).transpose(0, 2)
-        else:
-            batch_tgt_idxs = self._align_pad_prediction(
-                predictions, bos=self._tgt_bos_idx, pad=self._tgt_pad_idx)
+        batch_tgt_idxs = self._align_pad_prediction(
+            predictions, bos=self._tgt_bos_idx, pad=self._tgt_pad_idx)
         tgt_mask = (batch_tgt_idxs.eq(self._tgt_pad_idx) |
                     batch_tgt_idxs.eq(self._tgt_eos_idx) |
                     batch_tgt_idxs.eq(self._tgt_bos_idx))
@@ -663,8 +667,10 @@ class Translator(object):
 
         # (2) prep decode_strategy. Possibly repeat src objects.
         src_map = batch.src_map if use_src_map else None
+        target_prefix = batch.tgt if self.tgt_prefix else None
         fn_map_state, memory_bank, memory_lengths, src_map = \
-            decode_strategy.initialize(memory_bank, src_lengths, src_map)
+            decode_strategy.initialize(memory_bank, src_lengths, src_map,
+                                       target_prefix=target_prefix)
         if fn_map_state is not None:
             self.model.decoder.map_state(fn_map_state)
 

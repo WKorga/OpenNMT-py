@@ -93,7 +93,8 @@ class BeamSearch(DecodeStrategy):
             not stepwise_penalty and self.global_scorer.has_cov_pen)
         self._cov_pen = self.global_scorer.has_cov_pen
 
-    def initialize(self, memory_bank, src_lengths, src_map=None, device=None):
+    def initialize(self, memory_bank, src_lengths, src_map=None, device=None,
+                   target_prefix=None):
         """Initialize for decoding.
         Repeat src objects `beam_size` times.
         """
@@ -114,8 +115,12 @@ class BeamSearch(DecodeStrategy):
             device = mb_device
 
         self.memory_lengths = tile(src_lengths, self.beam_size)
+        if target_prefix is not None:
+            target_prefix = tile(target_prefix, self.beam_size, dim=1)
+
         super(BeamSearch, self).initialize(
-            memory_bank, self.memory_lengths, src_map, device)
+            memory_bank, self.memory_lengths, src_map, device, target_prefix)
+
         self.best_scores = torch.full(
             [self.batch_size], -1e10, dtype=torch.float, device=device)
         self._beam_offset = torch.arange(
@@ -147,6 +152,25 @@ class BeamSearch(DecodeStrategy):
     def batch_offset(self):
         return self._batch_offset
 
+    def _pick(self, log_probs):
+        """Return token decision for a step.
+
+        Args:
+            log_probs (FloatTensor): (B, vocab_size)
+
+        Returns:
+            topk_scores (FloatTensor): (B, beam_size)
+            topk_ids (LongTensor): (B, beam_size)
+        """
+        vocab_size = log_probs.size(-1)
+        # maybe fix some prediction at this step by modifying log_probs
+        log_probs = self.target_prefixing(log_probs)
+
+        # Flatten probs into a list of possibilities.
+        curr_scores = log_probs.reshape(-1, self.beam_size * vocab_size)
+        topk_scores, topk_ids = torch.topk(curr_scores, self.beam_size, dim=-1)
+        return topk_scores, topk_ids
+
     def advance(self, log_probs, attn):
         vocab_size = log_probs.size(-1)
 
@@ -176,10 +200,8 @@ class BeamSearch(DecodeStrategy):
         # Avoid any direction that would repeat unwanted ngrams
         self.block_ngram_repeats(curr_scores)
 
-        # Flatten probs into a list of possibilities.
-        curr_scores = curr_scores.reshape(_B, self.beam_size * vocab_size)
-        torch.topk(curr_scores,  self.beam_size, dim=-1,
-                   out=(self.topk_scores, self.topk_ids))
+        # Pick up candidate token by curr_scores
+        self.topk_scores, self.topk_ids = self._pick(curr_scores)
 
         # Recover log probs.
         # Length penalty is just a scalar. It doesn't matter if it's applied
@@ -187,7 +209,7 @@ class BeamSearch(DecodeStrategy):
         torch.mul(self.topk_scores, length_penalty, out=self.topk_log_probs)
 
         # Resolve beam origin and map to batch index flat representation.
-        torch.div(self.topk_ids, vocab_size, out=self._batch_index)
+        self._batch_index = self.topk_ids // vocab_size
         self._batch_index += self._beam_offset[:_B].unsqueeze(1)
         self.select_indices = self._batch_index.view(_B * self.beam_size)
         self.topk_ids.fmod_(vocab_size)  # resolve true word ids
@@ -247,7 +269,7 @@ class BeamSearch(DecodeStrategy):
         non_finished_batch = []
         for i in range(self.is_finished.size(0)):  # Batch level
             b = self._batch_offset[i]
-            finished_hyp = self.is_finished[i].nonzero().view(-1)
+            finished_hyp = self.is_finished[i].nonzero(as_tuple=False).view(-1)
             # Store finished hypotheses for this batch.
             for j in finished_hyp:  # Beam level: finished beam j in batch i
                 if self.ratio > 0:
@@ -300,6 +322,7 @@ class BeamSearch(DecodeStrategy):
             .view(-1, self.alive_seq.size(-1))
         self.topk_scores = self.topk_scores.index_select(0, non_finished)
         self.topk_ids = self.topk_ids.index_select(0, non_finished)
+        self.maybe_update_target_prefix(self.select_indices)
         if self.alive_attn is not None:
             inp_seq_len = self.alive_attn.size(-1)
             self.alive_attn = attention.index_select(1, non_finished) \
